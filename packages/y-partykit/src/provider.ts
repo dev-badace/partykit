@@ -9,6 +9,7 @@ import * as awarenessProtocol from "y-protocols/awareness";
 import { Observable } from "lib0/observable";
 import * as math from "lib0/math";
 import * as url from "lib0/url";
+import { sendChunked } from "./chunking";
 
 export const messageSync = 0;
 export const messageQueryAwareness = 3;
@@ -546,7 +547,7 @@ function assertType(value: unknown, label: string, type: string) {
   }
 }
 
-type Params = Record<string, string>;
+type Params = Record<string, string | null | undefined>;
 type ParamsProvider = Params | (() => Params | Promise<Params>);
 type BaseProviderOptions = ConstructorParameters<typeof WebsocketProvider>[3];
 
@@ -558,6 +559,14 @@ type YPartyKitProviderOptions = Omit<
   party?: string;
   params?: ParamsProvider;
 };
+
+class ChunkedWebSocket extends WebSocket {
+  send(data: string | ArrayBufferLike) {
+    if (typeof data !== "string") {
+      sendChunked(data, (chunk) => super.send(chunk));
+    }
+  }
+}
 
 export default class YPartyKitProvider extends WebsocketProvider {
   id: string;
@@ -593,7 +602,11 @@ export default class YPartyKitProvider extends WebsocketProvider {
     const { params, connect = true, ...rest } = options;
 
     // don't connect until we've updated the url parameters
-    const baseOptions = { ...rest, connect: false };
+    const baseOptions = {
+      ...rest,
+      connect: false,
+      WebSocketPolyfill: ChunkedWebSocket,
+    };
 
     super(serverUrl, room, doc ?? new YDoc(), baseOptions);
 
@@ -612,12 +625,18 @@ export default class YPartyKitProvider extends WebsocketProvider {
     )
       .then((nextParams) => {
         // override current url parameters before connecting
-        const nextUrl = new URL(this.url);
-        nextUrl.search = url.encodeQueryParams({
-          ...nextParams,
-          _pk: this.id,
-        });
+        const urlParams = new URLSearchParams([["_pk", this.id]]);
+        if (nextParams) {
+          for (const [key, value] of Object.entries(nextParams)) {
+            // filter out null/undefined values
+            if (value !== null && value !== undefined) {
+              urlParams.append(key, value);
+            }
+          }
+        }
 
+        const nextUrl = new URL(this.url);
+        nextUrl.search = urlParams.toString();
         this.url = nextUrl.toString();
 
         // finally, connect

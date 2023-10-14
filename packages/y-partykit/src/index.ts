@@ -7,12 +7,16 @@ import * as decoding from "lib0/decoding";
 import debounce from "lodash.debounce";
 import type * as Party from "partykit/server";
 import { YPartyKitStorage } from "./storage";
+import { handleChunked } from "./chunking";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
     throw new Error(message);
   }
 }
+
+const MAX_BYTES = 10_000_000;
+const MAX_UPDATES = Number.MAX_SAFE_INTEGER;
 
 const wsReadyStateConnecting = 0;
 const wsReadyStateOpen = 1;
@@ -64,14 +68,43 @@ class WSSharedDoc extends YDoc {
   conns: Map<Party.Connection, Set<number>>;
   awareness: awarenessProtocol.Awareness;
   storage: YPartyKitStorage | undefined;
-  persist: boolean;
+  persist: YPartyKitPersistenceStrategy | undefined;
+  persistMaxBytes = MAX_BYTES;
+  persistMaxUpdates = MAX_UPDATES;
   gc: boolean;
 
   constructor(room: Party.Party, options: YPartyKitOptions) {
     super({ gc: options.gc ?? !options.persist });
     this.gc = options.gc ?? !options.persist;
     this.name = room.id;
-    this.persist = options.persist ?? false;
+
+    if (options.persist) {
+      if (options.persist === true) {
+        console.warn(
+          "y-partykit: Using deprecated option `persist: true`. Choose an explicit persistence strategy instead. See: https://docs.partykit.io/reference/y-partykit-api/#persistence"
+        );
+        this.persist = {
+          mode: "history",
+          maxBytes: MAX_BYTES,
+          maxUpdates: MAX_UPDATES,
+        };
+      } else if (options.persist?.mode === "history") {
+        if ((options.persist.maxBytes ?? 0) > MAX_BYTES) {
+          console.warn(
+            "y-partykit: `persist.maxBytes` exceeds maximum allowed value 10_000_000 (10MB). Using default value instead. See: https://docs.partykit.io/reference/y-partykit-api/#persistence"
+          );
+        }
+
+        const { maxBytes, maxUpdates } = options.persist;
+        this.persist = {
+          mode: "history",
+          maxBytes: Math.min(MAX_BYTES, maxBytes || MAX_BYTES),
+          maxUpdates: Math.min(MAX_UPDATES, maxUpdates || MAX_UPDATES),
+        };
+      } else {
+        this.persist = options.persist;
+      }
+    }
 
     if (options.persist) {
       this.storage = new YPartyKitStorage(room.storage);
@@ -128,8 +161,6 @@ class WSSharedDoc extends YDoc {
   async bindState() {
     assert(this.storage, "Storage not set");
     const persistedYdoc = await this.storage.getYDoc(this.name);
-    const newUpdates = encodeStateAsUpdate(this);
-    await this.storage.storeUpdate(this.name, newUpdates);
     applyUpdate(this, encodeStateAsUpdate(persistedYdoc));
     this.on("update", (update) => {
       assert(this.storage, "Storage not set");
@@ -138,10 +169,26 @@ class WSSharedDoc extends YDoc {
       });
     });
   }
+  /**
+   * Appends the entire document state as an update to the update log.
+   */
   async writeState() {
     assert(this.storage, "Storage not set");
     const newUpdates = encodeStateAsUpdate(this);
     await this.storage.storeUpdate(this.name, newUpdates);
+  }
+
+  /**
+   * Replaces the current update log with the current state of the document.
+   */
+  async compactUpdateLog() {
+    assert(this.storage, "Storage not set");
+
+    await this.storage.compactUpdateLog(
+      this.name,
+      (this.persist?.mode === "history" && this.persist.maxUpdates) || 0,
+      (this.persist?.mode === "history" && this.persist.maxBytes) || 0
+    );
   }
 }
 
@@ -201,7 +248,7 @@ async function getYDoc(
     options.persist = false;
   }
 
-  if (options.gc === undefined && options.persist === true) {
+  if (options.gc === undefined && options.persist) {
     options.gc = false;
   }
 
@@ -356,7 +403,7 @@ function closeConn(doc: WSSharedDoc, conn: Party.Connection): void {
     );
     if (doc.conns.size === 0 && doc.persist) {
       // if persisted, we store state and destroy ydocument
-      doc.writeState().then(
+      doc.compactUpdateLog().then(
         () => {
           doc.destroy();
         },
@@ -418,12 +465,47 @@ interface UrlCallbackOptions extends CallbackOptions {
 
 type YPartyKitCallbackOptions = HandlerCallbackOptions | UrlCallbackOptions;
 
+export type YPartyKitPersistenceStrategy =
+  | {
+      /** Persist document edit history */
+      mode: "history";
+      /**
+       * Maximum number of updates to persist before compressing.
+       * If value is not set, the update history length is capped by `maxBytes`.
+       **/
+      maxUpdates?: number;
+      /**
+       * Maximum total update size to persist before compressing.
+       * The default value, and the largest allowed value is 10MB (10_000_000 bytes).
+       **/
+      maxBytes?: number;
+    }
+  | {
+      /**
+       * Persist document snapshot.
+       * Keeps full document history as long as there are connected clients,
+       * and compresses changes to a snapshot when last client disconnects.
+       **/
+      mode: "snapshot";
+    };
+
 export type YPartyKitOptions = {
   /**
-   * disable gc when using snapshots!
+   * disable gc when using persist!
    * */
   gc?: boolean;
-  persist?: boolean;
+
+  /**
+   * Whether to persist the document to PartyKit room storage.
+   *
+   * - {mode: "snapshot"} — persist full document snapshot (recommended)
+   * - {mode: "history", maxUpdates, maxBytes } — persist document edit history
+   * - true — Equivalent to { mode: "history" } (deprecated, use { mode: "history "} instead)
+   * - false — Do not persist document or history (default value)
+   *
+   * See https://docs.partykit.io/reference/y-partykit-api/#persistence
+   */
+  persist?: YPartyKitPersistenceStrategy | boolean;
   callback?: YPartyKitCallbackOptions;
   load?: () => Promise<YDoc>;
   readOnly?: boolean;
@@ -448,18 +530,21 @@ export async function onConnect(
   const doc = await getYDoc(room, options);
   doc.conns.set(conn, new Set());
   // listen and reply to events
-  conn.addEventListener("message", (message) => {
-    if (typeof message.data !== "string") {
-      return messageListener(
-        conn,
-        doc,
-        new Uint8Array(message.data),
-        options.readOnly ?? false
-      );
-    } else {
-      // silently ignore anything else
-    }
-  });
+  conn.addEventListener(
+    "message",
+    handleChunked((data) => {
+      if (typeof data !== "string") {
+        return messageListener(
+          conn,
+          doc,
+          new Uint8Array(data),
+          options.readOnly ?? false
+        );
+      } else {
+        // silently ignore anything else
+      }
+    })
+  );
 
   conn.addEventListener("close", () => {
     closeConn(doc, conn);

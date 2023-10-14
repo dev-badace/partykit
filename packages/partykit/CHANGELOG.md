@@ -1,5 +1,23 @@
 # partykit
 
+## 0.0.30
+
+### Patch Changes
+
+- [#476](https://github.com/partykit/partykit/pull/476) [`ad6be5b`](https://github.com/partykit/partykit/commit/ad6be5b7085ccf4bd7533af98141caea9040de65) Thanks [@threepointone](https://github.com/threepointone)! - await multiparties.socket()
+
+  This introduces a new method `.socket()` to the multiparties bag. Much like the .fetch() method() on the bag, this now uses an internal api to connect with a websocket to the party, instead of using a URL and connecting via the internet. Importantly, this also works from inside onFetch() handlers. This patch also deprecates the previous `.connect()` method.
+
+- [#473](https://github.com/partykit/partykit/pull/473) [`cf8cb27`](https://github.com/partykit/partykit/commit/cf8cb27e6a934f34c0266bbdae3f9f3b091aaa50) Thanks [@jevakallio](https://github.com/jevakallio)! - Fix login on WebKit (Safari)
+
+## 0.0.29
+
+### Patch Changes
+
+- [#472](https://github.com/partykit/partykit/pull/472) [`a9b17f9`](https://github.com/partykit/partykit/commit/a9b17f9ccb6a479aa721a2ddc5737c464e399fd2) Thanks [@jevakallio](https://github.com/jevakallio)! - Allow preflight requests when Chrome Private Network Access is enabled
+
+- [#470](https://github.com/partykit/partykit/pull/470) [`cdceba8`](https://github.com/partykit/partykit/commit/cdceba89c7562359e2b8dc21dc2f2085bc24ecc1) Thanks [@dev-badace](https://github.com/dev-badace)! - added missing crypto from node_compat
+
 ## 0.0.28
 
 ### Patch Changes
